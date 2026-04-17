@@ -103,7 +103,7 @@ if [ "$BBR_OK" -eq 1 ]; then
 else
     # 回退方案：默认 stack + HTCP 拥塞控制（高 BDP 链路下表现优于 cubic）
     kldload cc_htcp 2>/dev/null || true
-    if sysctl -n net.inet.tcp.cc.available 2>/dev/null | grep -qw htcp; then
+    if sysctl -n net.inet.tcp.cc.available 2>/dev/null | grep -q htcp; then
         sysctl net.inet.tcp.cc.algorithm=htcp >/dev/null 2>&1 || true
         TCP_STACK_CFG='net.inet.tcp.cc.algorithm=htcp'
         echo "[!] 回退方案：默认 stack + htcp 拥塞控制"
@@ -263,9 +263,13 @@ fi
 # ── /etc/rc.conf 持久化 ──────────────────────────────────────
 echo "[*] 更新 /etc/rc.conf"
 
-# 开机自动 kldload 模块
+# 开机自动 kldload 模块（检查已有值，避免重复追加）
 if [ "$BBR_OK" -eq 1 ]; then
-    sysrc -f /etc/rc.conf kld_list+=" tcp_rack tcp_bbr" >/dev/null
+    CUR_KLD=$(sysrc -n kld_list 2>/dev/null || true)
+    case " $CUR_KLD " in
+        *" tcp_rack "*) ;;   # 已包含，跳过
+        *) sysrc -f /etc/rc.conf kld_list+=" tcp_rack tcp_bbr" >/dev/null ;;
+    esac
 fi
 
 # powerd ≈ Linux tuned 的 throughput-performance profile
@@ -324,7 +328,7 @@ seedbox_tune_start()
 
     # 若 tcp_bbr 已通过 kld_list 加载，再次确认默认 stack 为 bbr
     if sysctl -n net.inet.tcp.functions_available 2>/dev/null | \
-            grep -qw bbr; then
+            grep -q bbr; then
         sysctl net.inet.tcp.functions_default=bbr >/dev/null 2>&1 || true
     fi
 }
