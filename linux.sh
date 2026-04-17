@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # ════════════════════════════════════════════════════════════════
 #  Seedbox 系统调优脚本 — Linux
 #
@@ -13,7 +13,7 @@
 # ════════════════════════════════════════════════════════════════
 
 # 不开启 -e：本脚本是"尽力而为"的调优性质，单步失败应让后续步骤继续
-set -uo pipefail
+set -u
 
 # ── 前置检查 ─────────────────────────────────────────────────
 [ "$(id -u)" -eq 0 ] || { echo "[!] 需 root 权限运行"; exit 1; }
@@ -38,6 +38,16 @@ if [ -z "$IFACE" ]; then
 fi
 
 echo "[*] 网卡: $IFACE   虚拟化: $VIRT_KIND   内核: $(uname -r)"
+
+# ── 备份现有配置 ─────────────────────────────────────────────
+TS=$(date +%Y%m%d-%H%M%S)
+echo "[*] 备份现有配置 (后缀 .bak-${TS})"
+for f in /etc/sysctl.conf /etc/security/limits.conf; do
+    if [ -f "$f" ]; then
+        cp -p "$f" "${f}.bak-${TS}"
+        echo "    ${f} -> ${f}.bak-${TS}"
+    fi
+done
 
 # ── 安装依赖 ─────────────────────────────────────────────────
 echo "[*] 更新软件源并安装依赖..."
@@ -107,7 +117,7 @@ fi
 
 # ── 初始拥塞 / 接收窗口 ─────────────────────────────────────
 echo "[*] 设置 initcwnd=25 initrwnd=25..."
-iproute=$(ip -o -4 route show to default 2>/dev/null || true)
+iproute=$(ip -o -4 route show to default 2>/dev/null | head -n 1 || true)
 if [ -n "$iproute" ]; then
     ip route change $iproute initcwnd 25 initrwnd 25 2>/dev/null \
         && echo "[✓] initcwnd / initrwnd 已设置" \
@@ -120,7 +130,7 @@ fi
 # 旋转介质 (HDD) → mq-deadline；非旋转 (SSD/NVMe) → kyber
 echo "[*] 配置块设备 I/O 调度器..."
 for d in $(lsblk -nd --output NAME 2>/dev/null); do
-    [[ "$d" =~ ^(loop|ram|zram) ]] && continue
+    case "$d" in loop*|ram*|zram*) continue ;; esac
     [ -w "/sys/block/$d/queue/scheduler" ] || continue
 
     rotational=$(cat "/sys/block/$d/queue/rotational" 2>/dev/null || echo "1")
@@ -131,7 +141,7 @@ for d in $(lsblk -nd --output NAME 2>/dev/null); do
                 && echo "[✓] $d (SSD/NVMe) → kyber" \
                 || echo "[!] $d: kyber 写入失败"
         else
-            cur=$(grep -o '\[.*\]' "/sys/block/$d/queue/scheduler" 2>/dev/null | tr -d '[]')
+            cur=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' "/sys/block/$d/queue/scheduler" 2>/dev/null)
             echo "[!] $d (SSD/NVMe): 内核未编译 kyber，保持 ${cur:-unknown}"
         fi
     else
@@ -141,7 +151,7 @@ for d in $(lsblk -nd --output NAME 2>/dev/null); do
                 && echo "[✓] $d (HDD) → mq-deadline" \
                 || echo "[!] $d: mq-deadline 写入失败"
         else
-            cur=$(grep -o '\[.*\]' "/sys/block/$d/queue/scheduler" 2>/dev/null | tr -d '[]')
+            cur=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' "/sys/block/$d/queue/scheduler" 2>/dev/null)
             echo "[!] $d (HDD): 内核未编译 mq-deadline，保持 ${cur:-unknown}"
         fi
     fi
@@ -367,7 +377,7 @@ lsmod | grep -q sch_fq  && echo "[✓] sch_fq  模块已加载" || echo "[!] sch
 # 通过 systemd 服务在每次启动时重新应用
 echo "[*] 创建开机自启脚本..."
 cat > /root/.boot-script.sh <<'BOOTEOF'
-#!/bin/bash
+#!/bin/sh
 # Seedbox 开机调优脚本 — 由主调优脚本生成
 sleep 120
 
@@ -405,7 +415,7 @@ fi
 
 # I/O 调度器
 for d in $(lsblk -nd --output NAME 2>/dev/null); do
-    [[ "$d" =~ ^(loop|ram|zram) ]] && continue
+    case "$d" in loop*|ram*|zram*) continue ;; esac
     [ -w "/sys/block/$d/queue/scheduler" ] || continue
     rotational=$(cat "/sys/block/$d/queue/rotational" 2>/dev/null || echo "1")
     if [ "$rotational" = "0" ]; then
@@ -418,7 +428,7 @@ for d in $(lsblk -nd --output NAME 2>/dev/null); do
 done
 
 # initcwnd / initrwnd
-iproute=$(ip -o -4 route show to default 2>/dev/null || true)
+iproute=$(ip -o -4 route show to default 2>/dev/null | head -n 1 || true)
 [ -n "$iproute" ] && ip route change $iproute initcwnd 25 initrwnd 25 2>/dev/null || true
 
 # BBR 模块
@@ -457,7 +467,7 @@ echo "              调优完成"
 echo "═══════════════════════════════════════════"
 echo "环境       : $VIRT_KIND  /  内核 $(uname -r)"
 echo "网卡       : $IFACE"
-echo "  txqueuelen : $(ip link show "$IFACE" 2>/dev/null | grep -oP 'qlen \K[0-9]+' || echo '未知')"
+echo "  txqueuelen : $(ip link show "$IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="qlen"){print $(i+1);exit}}' || echo '未知')"
 echo ""
 if [ "$IS_VIRT" -eq 1 ]; then
     echo "硬件卸载（虚拟化环境，已关闭）:"
@@ -479,15 +489,16 @@ echo "  拥塞控制 : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null |
 echo "  队列调度 : $(sysctl -n net.core.default_qdisc          2>/dev/null || echo '未知')"
 echo ""
 echo "提示: limits.conf / systemd 文件描述符上限需重启后完全生效"
+echo "备份后缀: .bak-${TS}"
 echo "建议: reboot"
 echo ""
 echo "回滚步骤:"
-echo "  1. 恢复 /etc/sysctl.conf 备份（脚本未自动备份，请提前手工保存）"
-echo "  2. systemctl disable boot-script.service"
-echo "  3. rm /root/.boot-script.sh /etc/systemd/system/boot-script.service"
-echo "  4. rm /etc/modules-load.d/seedbox-bbr.conf"
-echo "  5. rm /etc/systemd/system.conf.d/99-seedbox.conf"
-echo "  6. 编辑 /etc/security/limits.conf 移除 'added by seedbox tuning' 块"
+echo "  1. cp /etc/sysctl.conf.bak-${TS} /etc/sysctl.conf"
+echo "  2. cp /etc/security/limits.conf.bak-${TS} /etc/security/limits.conf"
+echo "  3. systemctl disable boot-script.service"
+echo "  4. rm /root/.boot-script.sh /etc/systemd/system/boot-script.service"
+echo "  5. rm /etc/modules-load.d/seedbox-bbr.conf"
+echo "  6. rm /etc/systemd/system.conf.d/99-seedbox.conf"
 echo "  7. systemctl daemon-reload && systemctl daemon-reexec"
 echo "═══════════════════════════════════════════"
 
