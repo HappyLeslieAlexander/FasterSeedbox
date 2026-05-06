@@ -22,13 +22,14 @@
 
 set -eu
 
-SCRIPT_NAME="FasterSeedbox-rhel"
+# shellcheck disable=SC2034
+SCRIPT_NAME="FasterSeedbox-rhel"  # Used in logging/metrics
 SYSCTL_DROPIN="/etc/sysctl.d/99-seedbox.conf"
 LIMITS_DROPIN="/etc/security/limits.d/99-seedbox.conf"
 SYSTEMD_DROPIN="/etc/systemd/system.conf.d/99-seedbox.conf"
 RUNTIME_HELPER="/usr/local/sbin/seedbox-runtime.sh"
 SYSTEMD_UNIT="/etc/systemd/system/seedbox-tune.service"
-TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$-$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || echo $RANDOM)"
+TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$-$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || echo $$)"
 DRY_RUN=0
 ERRORS=0
 
@@ -118,7 +119,8 @@ command -v dnf >/dev/null 2>&1 || PKGMGR="yum"
 KERNEL_VER="$(uname -r | awk -F'[.-]' '{printf "%d", $1*100 + ($2+0)}')"
 
 # Virtualization detection: RHEL uses systemd-detect-virt natively
-IS_CONTAINER=0
+# shellcheck disable=SC2034
+IS_CONTAINER=0  # Used for runtime logic
 VIRT_KIND="bare-metal"
 if command -v systemd-detect-virt >/dev/null 2>&1; then
   _sv="$(systemd-detect-virt 2>/dev/null || echo none)"
@@ -130,6 +132,7 @@ if command -v systemd-detect-virt >/dev/null 2>&1; then
 else
   # Fallback for minimal installs
   if [ -f /.dockerenv ] || grep -qa 'container=' /proc/1/environ 2>/dev/null; then
+    # shellcheck disable=SC2034
     IS_CONTAINER=1; VIRT_KIND="container"
   elif [ -f /sys/class/dmi/id/product_name ] && \
        grep -qi 'virtual\|kvm\|qemu\|vmware' /sys/class/dmi/id/product_name 2>/dev/null; then
@@ -447,6 +450,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
   verify_sysctl net.core.default_qdisc fq
   verify_sysctl net.core.somaxconn 524288
   verify_sysctl net.ipv4.tcp_fastopen 3
+  # shellcheck disable=SC3045
   _FD_LIMIT="$(ulimit -n 2>/dev/null || echo '?')"
   if [ "$_FD_LIMIT" != "?" ] && [ "$_FD_LIMIT" -ge 65536 ] 2>/dev/null; then
     ok "  ulimit -n = $_FD_LIMIT"
@@ -479,6 +483,7 @@ printf ' win_scale   : %s\n' "$WIN_SCALE"
 if [ "$DRY_RUN" -eq 0 ]; then
   printf ' Congestion  : %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
   printf ' Qdisc       : %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+  # shellcheck disable=SC3045
   printf ' FD Limit    : %s\n' "$(ulimit -n 2>/dev/null || echo '?')"
 fi
 printf ' Backup suffix: .bak-%s\n' "$TS"

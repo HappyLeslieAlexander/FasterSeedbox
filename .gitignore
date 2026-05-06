@@ -1,1 +1,1 @@
-Nothing needs to be added to .gitignore since only a shell script file (`alpine.sh`) was modified and no build artifacts, dependencies, or temporary files were detected in the changes.
+Nothing needs to be added to the .gitignore file since only a shell script file (`rhel.sh`) was modified and no build artifacts, dependencies, or temporary files were included in the changes.
