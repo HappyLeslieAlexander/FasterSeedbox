@@ -25,6 +25,8 @@
 
 set -eu  # Added -e for fail-fast on critical errors
 
+# SCRIPT_NAME is used for logging identification in some contexts
+# shellcheck disable=SC2034
 SCRIPT_NAME="FasterSeedbox-linux"
 SYSCTL_DROPIN="/etc/sysctl.d/99-seedbox.conf"
 LIMITS_DROPIN="/etc/security/limits.d/99-seedbox.conf"
@@ -33,7 +35,12 @@ MODULES_DROPIN="/etc/modules-load.d/seedbox-bbr.conf"
 RUNTIME_HELPER="/usr/local/sbin/seedbox-runtime.sh"
 SYSTEMD_UNIT="/etc/systemd/system/seedbox-tune.service"
 # Use nanosecond precision + random suffix to prevent collision
-TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$-$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || echo $RANDOM)"
+# Generate random suffix: try /dev/urandom, fallback to PID if unavailable
+_RAND_SUFFIX="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')"
+if [ -z "$_RAND_SUFFIX" ]; then
+  _RAND_SUFFIX="$$"
+fi
+TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$_RAND_SUFFIX"
 DRY_RUN=0
 ERRORS=0
 
@@ -137,6 +144,8 @@ fi
 KERNEL_VER="$(uname -r | awk -F'[.-]' '{printf "%d", $1*100 + ($2+0)}')"
 
 # Virtualization detection with clear priority: container > vm > bare-metal
+# VIRT_IS_CONTAINER is used by downstream scripts and runtime helpers
+# shellcheck disable=SC2034
 if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -q 2>/dev/null; then
   VIRT_KIND="$(systemd-detect-virt 2>/dev/null || echo unknown)"
   # Normalize container types for consistent handling
@@ -577,6 +586,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
   verify_sysctl net.core.somaxconn 524288
   verify_sysctl net.ipv4.tcp_fastopen 3
   # Verify runtime limits
+  # shellcheck disable=SC3045  # ulimit is widely supported in bash/dash/ash
   _FD_LIMIT="$(ulimit -n 2>/dev/null || echo '?')"
   if [ "$_FD_LIMIT" != "?" ] && [ "$_FD_LIMIT" -ge 65536 ] 2>/dev/null; then
     ok "  ulimit -n = $_FD_LIMIT"
@@ -617,6 +627,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
   printf ' Qdisc       : %s\n' \
     "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+  # shellcheck disable=SC3045  # ulimit is widely supported in bash/dash/ash
   printf ' FD Limit    : %s\n' "$(ulimit -n 2>/dev/null || echo '?')"
 fi
 printf ' Backup suffix: .bak-%s\n' "$TS"
