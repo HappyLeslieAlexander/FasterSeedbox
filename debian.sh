@@ -166,20 +166,26 @@ calc_memory_tier() {
 }
 
 # Atomic file write with backup & temp leak protection (POSIX strict)
+# Global temp file tracking to prevent trap overwriting
+_WF_TMPFILES=""
+
+_global_cleanup() {
+    for _f in $_WF_TMPFILES; do rm -f "$_f" 2>/dev/null; done
+}
+trap _global_cleanup EXIT INT TERM HUP
+
 write_file() {
     _wf_path="$1"
     _wf_tmp="${_wf_path}.tmp.$$"
     
-    # Cleanup trap
-    _wf_cleanup() { rm -f "$_wf_tmp" 2>/dev/null; }
-    trap _wf_cleanup EXIT INT TERM HUP
+    # Register temp file for global cleanup (avoids trap overwriting)
+    _WF_TMPFILES="$_WF_TMPFILES $_wf_tmp"
 
     if [ $DRY_RUN -eq 1 ]; then
         log_info "[DRY-RUN] Would write to: $_wf_path"
         log_info "--- BEGIN PREVIEW ---"
         cat
         log_info "--- END PREVIEW ---"
-        trap - EXIT INT TERM HUP
         return 0
     fi
 
@@ -190,18 +196,15 @@ write_file() {
 
     if ! cat >"$_wf_tmp"; then
         log_err "Failed to write temporary file for $_wf_path"
-        trap - EXIT INT TERM HUP
         return 1
     fi
 
     if ! mv -f "$_wf_tmp" "$_wf_path"; then
         log_err "Failed to install $_wf_path"
-        trap - EXIT INT TERM HUP
         return 1
     fi
 
     log_info "Written: $_wf_path"
-    trap - EXIT INT TERM HUP
     return 0
 }
 
@@ -246,6 +249,11 @@ verify_sysctl() {
 
 module_available() {
     _mod="$1"
+    # Check if module is built-in (e.g., tcp_bbr on Ubuntu 20.04+ with CONFIG_TCP_CONG_BBR=y)
+    if grep -qw "$_mod" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        return 0
+    fi
+    # Fallback: check for .ko file or modprobe availability
     _mod_dir="/usr/lib/modules/$(uname -r)"
     [ -d "$_mod_dir" ] || _mod_dir="/lib/modules/$(uname -r)"
     
@@ -297,7 +305,7 @@ net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
+# net.ipv4.tcp_fack = 1  # Removed: deprecated in Linux 5.4+, causes sysctl errors on modern kernels
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 
@@ -306,6 +314,9 @@ net.core.netdev_max_backlog = 65536
 net.core.optmem_max = 33554432
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_no_metrics_save = 1
+# tcp_moderate_rcvbuf=1 allows kernel to auto-shrink recvbuf when connection is slow,
+# which may counteract large rmem_max settings during slow-start phase.
+# Keep enabled for memory efficiency; kernel will still expand buffer under high throughput.
 net.ipv4.tcp_moderate_rcvbuf = 1
 EOF
 }
@@ -321,8 +332,9 @@ $MARKER
 * hard nofile 1048576
 * soft nproc 65535
 * hard nproc 65535
-* soft memlock unlimited
-* hard memlock unlimited
+# memlock limited to 16GB to prevent DoS via mlockall() on multi-user systems
+* soft memlock 16777216
+* hard memlock 16777216
 EOF
 }
 
@@ -394,23 +406,23 @@ tune_initcwnd() {
     _default_route="$(ip -4 route show default 2>/dev/null | head -1)"
     [ -z "$_default_route" ] && return 0
 
-    _dev="$(echo "$_default_route" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')"
-    _via="$(echo "$_default_route" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')"
-
-    [ -z "$_dev" ] && return 0
-
-    if [ -n "$_via" ]; then
-        ip route replace default via "$_via" dev "$_dev" initcwnd 25 initrwnd 25 2>/dev/null || true
-    else
-        ip route replace default dev "$_dev" initcwnd 25 initrwnd 25 2>/dev/null || true
-    fi
-    log "Applied initcwnd tuning on $_dev"
+    # Extract all route attributes after "default", preserving proto/metric/src etc.
+    _route_attrs="$(echo "$_default_route" | sed 's/^default[[:space:]]*//')"
+    
+    ip route replace default $_route_attrs initcwnd 25 initrwnd 25 2>/dev/null || true
+    log "Applied initcwnd tuning"
 }
 
 main() {
     log "Starting runtime tuning..."
-    for _iface in $(ls /sys/class/net/ 2>/dev/null); do tune_nic "$_iface"; done
-    for _dev in $(ls /sys/block/ 2>/dev/null); do tune_disk "$_dev"; done
+    for _iface in /sys/class/net/*/; do
+        [ -d "$_iface" ] || continue
+        tune_nic "${_iface%/}"
+    done
+    for _dev in /sys/block/*/; do
+        [ -d "$_dev" ] || continue
+        tune_disk "${_dev##*/}"
+    done
     tune_initcwnd
     log "Runtime tuning complete"
 }
@@ -505,15 +517,9 @@ apply_initcwnd() {
     if [ $DRY_RUN -eq 0 ]; then
         _default_route="$(ip -4 route show default 2>/dev/null | head -1)"
         [ -n "$_default_route" ] && {
-            _dev="$(echo "$_default_route" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')"
-            _via="$(echo "$_default_route" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')"
-            [ -n "$_dev" ] && {
-                if [ -n "$_via" ]; then
-                    ip route replace default via "$_via" dev "$_dev" initcwnd 25 initrwnd 25 2>/dev/null || true
-                else
-                    ip route replace default dev "$_dev" initcwnd 25 initrwnd 25 2>/dev/null || true
-                fi
-            }
+            # Extract all route attributes after "default", preserving proto/metric/src etc.
+            _route_attrs="$(echo "$_default_route" | sed 's/^default[[:space:]]*//')"
+            ip route replace default $_route_attrs initcwnd 25 initrwnd 25 2>/dev/null || true
         }
     fi
 }
@@ -524,6 +530,7 @@ verify_configuration() {
     verify_sysctl "net.core.default_qdisc" "fq" || true
     verify_sysctl "net.core.somaxconn" "524288" || true
     verify_sysctl "net.ipv4.tcp_fastopen" "3" || true
+    verify_sysctl "net.ipv4.tcp_adv_win_scale" "$WIN_SCALE" || true
     [ -f "$LIMITS_DIR/99-seedbox.conf" ] && log_info "✓ File limits configured"
     [ -f "$SYSTEMD_CONF_DIR/99-seedbox.conf" ] && log_info "✓ Systemd limits configured"
 }
