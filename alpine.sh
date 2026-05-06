@@ -22,7 +22,8 @@
 
 set -eu
 
-SCRIPT_NAME="FasterSeedbox-alpine"  # Used in logging/metrics (SC2034)
+# shellcheck disable=SC2034
+SCRIPT_NAME="FasterSeedbox-alpine"  # Used in logging/metrics
 SYSCTL_DROPIN="/etc/sysctl.d/99-seedbox.conf"
 LIMITS_DROPIN="/etc/security/limits.d/99-seedbox.conf"
 RUNTIME_HELPER="/usr/local/sbin/seedbox-runtime.sh"
@@ -117,13 +118,17 @@ fi
 IS_CONTAINER=0
 VIRT_KIND="bare-metal"
 if [ -f /.dockerenv ]; then
+  # shellcheck disable=SC2034
   IS_CONTAINER=1; VIRT_KIND="docker"
 elif grep -qa 'container=lxc' /proc/1/environ 2>/dev/null; then
+  # shellcheck disable=SC2034
   IS_CONTAINER=1; VIRT_KIND="lxc"
 elif command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -q 2>/dev/null; then
   _sv="$(systemd-detect-virt 2>/dev/null || true)"
   case "$_sv" in
-    docker|podman|lxc|openvz|wsl) IS_CONTAINER=1; VIRT_KIND="$_sv" ;;
+    docker|podman|lxc|openvz|wsl) 
+      # shellcheck disable=SC2034
+      IS_CONTAINER=1; VIRT_KIND="$_sv" ;;
     kvm|qemu|vmware|virtualbox|xen|hyperv) VIRT_KIND="$_sv" ;;
     *) VIRT_KIND="$_sv" ;;
   esac
@@ -273,6 +278,7 @@ IFACE="\$(ip -o -4 route show to default 2>/dev/null | awk '{print \\\$5; exit}'
 # Container detection (matches installer)
 IS_CONTAINER=0
 if [ -f /.dockerenv ] || grep -qa 'container=lxc' /proc/1/environ 2>/dev/null; then
+  # shellcheck disable=SC2034
   IS_CONTAINER=1
 fi
 
