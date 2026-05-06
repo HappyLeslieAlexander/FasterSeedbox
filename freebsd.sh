@@ -21,7 +21,8 @@
 
 set -eu
 
-SCRIPT_NAME="FasterSeedbox-freebsd"  # Used in logging/metrics (SC2034)
+# shellcheck disable=SC2034
+SCRIPT_NAME="FasterSeedbox-freebsd"  # Used in logging/metrics
 SYSCTL_CONF="/etc/sysctl.conf"
 LOADER_CONF="/boot/loader.conf"
 RUNTIME_HELPER="/usr/local/sbin/seedbox-runtime.sh"
@@ -116,14 +117,18 @@ if [ "$FREEBSD_VER" -lt 1200000 ]; then
   exit 1
 fi
 
-# Virtualization detection (IS_JAIL/IS_VM used for runtime logic - SC2034)
+# Virtualization detection (IS_JAIL/IS_VM used for runtime logic)
+# shellcheck disable=SC2034
 IS_JAIL=0
+# shellcheck disable=SC2034
 IS_VM=0
 if [ "$(sysctl -n security.jail.jailed 2>/dev/null || echo 0)" = "1" ]; then
+  # shellcheck disable=SC2034
   IS_JAIL=1
   VIRT_KIND="jail"
 else
   VM_GUEST="$(sysctl -n kern.vm_guest 2>/dev/null || echo none)"
+  # shellcheck disable=SC2034
   case "$VM_GUEST" in
     none|bare-metal) VIRT_KIND="bare-metal"; IS_VM=0 ;;
     vmware|xen|kvm|qemu|hyperv|bhyve) VIRT_KIND="vm"; IS_VM=1 ;;
@@ -305,8 +310,10 @@ set -eu
 IFACE="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
 [ -n "${IFACE:-}" ] || exit 0
 
+# shellcheck disable=SC2034
 IS_VM=0
 VM_GUEST="$(sysctl -n kern.vm_guest 2>/dev/null || echo none)"
+# shellcheck disable=SC2034
 case "$VM_GUEST" in vmware|xen|kvm|qemu|hyperv|bhyve) IS_VM=1 ;; esac
 
 sysctl -f /etc/sysctl.conf >/dev/null 2>&1 || warn "Failed to apply sysctl.conf"
