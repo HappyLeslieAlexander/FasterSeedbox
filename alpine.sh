@@ -56,9 +56,9 @@ WIN_SCALE=2
 # Utility Functions
 # ============================================================================
 
-log_info() { printf '[INFO] %s\n' "$@"; }
-log_warn() { printf '[WARN] %s\n' "$@" >&2; WARNINGS=$((WARNINGS + 1)); }
-log_err()  { printf '[ERR]  %s\n' "$@" >&2; ERRORS=$((ERRORS + 1)); }
+log_info() { printf '[INFO] %s\n' "$*"; }
+log_warn() { printf '[WARN] %s\n' "$*" >&2; WARNINGS=$((WARNINGS + 1)); }
+log_err()  { printf '[ERR]  %s\n' "$*" >&2; ERRORS=$((ERRORS + 1)); }
 
 die() {
     log_err "$@"
@@ -165,21 +165,26 @@ calc_memory_tier() {
 }
 
 # Atomic file write with backup & temp leak protection (POSIX strict)
+# Global temp file tracking to prevent trap overwriting across multiple calls
+_WF_TMPFILES=""
+
+_global_cleanup() {
+    for _f in $_WF_TMPFILES; do rm -f "$_f" 2>/dev/null; done
+}
+trap _global_cleanup EXIT INT TERM HUP
+
 write_file() {
     _wf_path="$1"
     _wf_tmp="${_wf_path}.tmp.$$"
     
-    # Cleanup trap (global variable to avoid scoping issues in POSIX sh)
-    _WF_TMP="$_wf_tmp"
-    _wf_cleanup() { rm -f "$_WF_TMP" 2>/dev/null; }
-    trap _wf_cleanup EXIT INT TERM HUP
+    # Register temp file for global cleanup (append, don't overwrite trap)
+    _WF_TMPFILES="$_WF_TMPFILES $_wf_tmp"
 
     if [ $DRY_RUN -eq 1 ]; then
         log_info "[DRY-RUN] Would write to: $_wf_path"
         log_info "--- BEGIN PREVIEW ---"
         cat
         log_info "--- END PREVIEW ---"
-        trap - EXIT INT TERM HUP
         return 0
     fi
 
@@ -190,18 +195,15 @@ write_file() {
 
     if ! cat >"$_wf_tmp"; then
         log_err "Failed to write temporary file for $_wf_path"
-        trap - EXIT INT TERM HUP
         return 1
     fi
 
     if ! mv -f "$_wf_tmp" "$_wf_path"; then
         log_err "Failed to install $_wf_path"
-        trap - EXIT INT TERM HUP
         return 1
     fi
 
     log_info "Written: $_wf_path"
-    trap - EXIT INT TERM HUP
     return 0
 }
 
@@ -246,6 +248,11 @@ verify_sysctl() {
 
 module_available() {
     _mod="$1"
+    # Check if already built-in (Alpine lts kernel has CONFIG_TCP_CONG_BBR=y)
+    if grep -qw "$_mod" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        return 0
+    fi
+    # Fallback: check .ko files or modprobe -n
     _mod_dir="/usr/lib/modules/$(uname -r)"
     [ -d "$_mod_dir" ] || _mod_dir="/lib/modules/$(uname -r)"
     
@@ -275,7 +282,8 @@ net.ipv4.tcp_rmem = 4096 87380 $RMEM_MAX
 net.ipv4.tcp_wmem = 4096 65536 $WMEM_MAX
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
-net.ipv4.tcp_adv_win_scale = ${WIN_SCALE}
+# tcp_adv_win_scale: Linux <5.4 only, removed in newer kernels
+# net.ipv4.tcp_adv_win_scale = ${WIN_SCALE}
 
 # === TCP Memory Pressure (in 4KB pages) ===
 net.ipv4.tcp_mem = $TCP_MEM_MIN $TCP_MEM_PRESS $TCP_MEM_MAX
@@ -293,7 +301,7 @@ net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_sack = 1
-net.ipv4.tcp_fack = 1
+# net.ipv4.tcp_fack = 1  # Removed in Linux 5.4+, do not enable
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps = 1
 
@@ -302,6 +310,9 @@ net.core.netdev_max_backlog = 65536
 net.core.optmem_max = 33554432
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_no_metrics_save = 1
+# tcp_moderate_rcvbuf=1 allows kernel to auto-shrink recvbuf under low throughput.
+# This may counteract the large rmem_max setting during slow-start phase.
+# Keep enabled for memory efficiency, but be aware it may limit initial burst.
 net.ipv4.tcp_moderate_rcvbuf = 1
 EOF
 }
@@ -314,8 +325,10 @@ $MARKER
 * hard nofile 1048576
 * soft nproc 65535
 * hard nproc 65535
-* soft memlock unlimited
-* hard memlock unlimited
+# memlock: Set reasonable limit to prevent DoS via mlockall()
+# 16GB max per process, adjust based on your needs
+* soft memlock 16777216
+* hard memlock 16777216
 EOF
 }
 
@@ -396,22 +409,25 @@ tune_initcwnd() {
     [ -z "$_default_route" ] && return 0
 
     _dev="$(echo "$_default_route" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')"
-    _via="$(echo "$_default_route" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')"
-
     [ -z "$_dev" ] && return 0
 
-    if [ -n "$_via" ]; then
-        ip route replace default via "$_via" dev "$_dev" initcwnd 25 initrwnd 25 2>/dev/null || true
-    else
-        ip route replace default dev "$_dev" initcwnd 25 initrwnd 25 2>/dev/null || true
-    fi
+    # Preserve all original route attributes (proto, metric, src, etc.)
+    # by extracting everything after "default" and appending initcwnd/initrwnd
+    _rest="$(echo "$_default_route" | sed 's/^default[[:space:]]*//' | sed 's/ initcwnd [0-9]*//g' | sed 's/ initrwnd [0-9]*//g')"
+    ip route replace default $_rest initcwnd 25 initrwnd 25 2>/dev/null || true
     log "Applied initcwnd tuning on $_dev"
 }
 
 main() {
     log "Starting runtime tuning..."
-    for _iface in $(ls /sys/class/net/ 2>/dev/null); do tune_nic "$_iface"; done
-    for _dev in $(ls /sys/block/ 2>/dev/null); do tune_disk "$_dev"; done
+    for _iface in /sys/class/net/*/; do
+        [ -d "$_iface" ] || continue
+        tune_nic "${_iface%/}"
+    done
+    for _dev in /sys/block/*/; do
+        [ -d "$_dev" ] || continue
+        tune_disk "${_dev##*/}"
+    done
     tune_initcwnd
     log "Runtime tuning complete"
 }
@@ -439,6 +455,21 @@ EOF
 
 apply_limits() {
     log_info "Generating file descriptor limits..."
+    
+    # Check if PAM limits module exists (musl/Alpine may not have it)
+    if ! [ -f /lib/security/pam_limits.so ] && \
+       ! [ -f /usr/lib/security/pam_limits.so ] && \
+       ! [ -f /lib64/security/pam_limits.so ]; then
+        log_warn "PAM limits not available (musl/no linux-pam)." \
+                 "limits.d config will be ignored. Configuring rc_ulimit fallback."
+        # Fallback: set global ulimit in /etc/rc.conf for all OpenRC services
+        append_once /etc/rc.conf <<'EOF'
+# FasterSeedbox: global ulimit for all OpenRC services
+rc_ulimit="-n 1048576 -u 65535"
+EOF
+        return 0
+    fi
+    
     write_file "$LIMITS_DIR/99-seedbox.conf" <<EOF
 $(generate_limits_conf)
 EOF
@@ -479,13 +510,10 @@ apply_initcwnd() {
         _default_route="$(ip -4 route show default 2>/dev/null | head -1)"
         [ -n "$_default_route" ] && {
             _dev="$(echo "$_default_route" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')"
-            _via="$(echo "$_default_route" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')"
             [ -n "$_dev" ] && {
-                if [ -n "$_via" ]; then
-                    ip route replace default via "$_via" dev "$_dev" initcwnd 25 initrwnd 25 2>/dev/null || true
-                else
-                    ip route replace default dev "$_dev" initcwnd 25 initrwnd 25 2>/dev/null || true
-                fi
+                # Preserve all original route attributes (proto, metric, src, etc.)
+                _rest="$(echo "$_default_route" | sed 's/^default[[:space:]]*//' | sed 's/ initcwnd [0-9]*//g' | sed 's/ initrwnd [0-9]*//g')"
+                ip route replace default $_rest initcwnd 25 initrwnd 25 2>/dev/null || true
             }
         }
     fi
@@ -497,7 +525,8 @@ verify_configuration() {
     verify_sysctl "net.core.default_qdisc" "fq" || true
     verify_sysctl "net.core.somaxconn" "524288" || true
     verify_sysctl "net.ipv4.tcp_fastopen" "3" || true
-    verify_sysctl "net.ipv4.tcp_adv_win_scale" "$WIN_SCALE" || true
+    # tcp_adv_win_scale removed in Linux 5.4+, skip verification on newer kernels
+    # verify_sysctl "net.ipv4.tcp_adv_win_scale" "$WIN_SCALE" || true
     [ -f "$LIMITS_DIR/99-seedbox.conf" ] && log_info "✓ PAM limits configured"
     [ -x "$INIT_D/seedbox-tune" ] && log_info "✓ OpenRC service installed"
 }
