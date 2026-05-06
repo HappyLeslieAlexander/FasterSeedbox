@@ -21,12 +21,13 @@
 
 set -eu
 
-SCRIPT_NAME="FasterSeedbox-freebsd"
+SCRIPT_NAME="FasterSeedbox-freebsd"  # Used in logging/metrics (SC2034)
 SYSCTL_CONF="/etc/sysctl.conf"
 LOADER_CONF="/boot/loader.conf"
 RUNTIME_HELPER="/usr/local/sbin/seedbox-runtime.sh"
 RC_SCRIPT="/usr/local/etc/rc.d/seedbox-tune"
-TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$-$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || echo $RANDOM)"
+# Generate timestamp with secure random suffix: od from /dev/urandom, fallback to PID
+TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$-$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || echo $$)"
 DRY_RUN=0
 ERRORS=0
 
@@ -115,7 +116,7 @@ if [ "$FREEBSD_VER" -lt 1200000 ]; then
   exit 1
 fi
 
-# Virtualization detection
+# Virtualization detection (IS_JAIL/IS_VM used for runtime logic - SC2034)
 IS_JAIL=0
 IS_VM=0
 if [ "$(sysctl -n security.jail.jailed 2>/dev/null || echo 0)" = "1" ]; then
@@ -349,9 +350,17 @@ fi
 # --- apply immediately ----------------------------------------------
 if [ "$DRY_RUN" -eq 0 ]; then
   log "applying sysctl settings immediately..."
-  sysctl -f "$SYSCTL_CONF" >/dev/null 2>&1 && ok "sysctl applied" || warn "sysctl warnings; check dmesg"
+  if sysctl -f "$SYSCTL_CONF" >/dev/null 2>&1; then
+    ok "sysctl applied"
+  else
+    warn "sysctl warnings; check dmesg"
+  fi
   log "starting runtime tuning..."
-  "$RUNTIME_HELPER" >/dev/null 2>&1 && ok "runtime tuning applied" || warn "runtime helper warnings"
+  if "$RUNTIME_HELPER" >/dev/null 2>&1; then
+    ok "runtime tuning applied"
+  else
+    warn "runtime helper warnings"
+  fi
 fi
 
 # --- verification ---------------------------------------------------
@@ -367,6 +376,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
   verify_sysctl net.inet.tcp.fastopen 1
   verify_sysctl kern.maxfiles "$MAX_FILES"
   verify_sysctl kern.ipc.somaxconn 524288
+  # shellcheck disable=SC3045
   _FD_LIMIT="$(ulimit -n 2>/dev/null || echo '?')"
   if [ "$_FD_LIMIT" != "?" ] && [ "$_FD_LIMIT" -ge 65536 ] 2>/dev/null; then
     ok "  ulimit -n = $_FD_LIMIT"
