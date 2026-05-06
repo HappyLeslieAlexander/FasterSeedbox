@@ -22,13 +22,13 @@
 
 set -eu
 
-SCRIPT_NAME="FasterSeedbox-alpine"
+SCRIPT_NAME="FasterSeedbox-alpine"  # Used in logging/metrics (SC2034)
 SYSCTL_DROPIN="/etc/sysctl.d/99-seedbox.conf"
 LIMITS_DROPIN="/etc/security/limits.d/99-seedbox.conf"
 RUNTIME_HELPER="/usr/local/sbin/seedbox-runtime.sh"
 RC_SCRIPT="/etc/init.d/seedbox-tune"
 # Nanosecond + random suffix to prevent backup collisions
-TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$-$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || echo $RANDOM)"
+TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$-$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || echo $$)"
 DRY_RUN=0
 ERRORS=0
 
@@ -113,6 +113,7 @@ if ! command -v apk >/dev/null 2>&1; then
 fi
 
 # Virtualization detection: container > vm > bare-metal
+# IS_CONTAINER is used in runtime checks (SC2034)
 IS_CONTAINER=0
 VIRT_KIND="bare-metal"
 if [ -f /.dockerenv ]; then
@@ -425,6 +426,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
   verify_sysctl net.core.default_qdisc fq
   verify_sysctl net.core.somaxconn 524288
   verify_sysctl net.ipv4.tcp_fastopen 3
+  # shellcheck disable=SC3045
   _FD_LIMIT="$(ulimit -n 2>/dev/null || echo '?')"
   if [ "$_FD_LIMIT" != "?" ] && [ "$_FD_LIMIT" -ge 65536 ] 2>/dev/null; then
     ok "  ulimit -n = $_FD_LIMIT"
