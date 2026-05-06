@@ -6,18 +6,21 @@
 #
 # Fixes applied:
 #   - P0: kldstat -q compatibility (removed, use redirect)
-#   - P0: sysrc += fallback for FreeBSD <12.2
-#   - P0: write_file() temp leak fixed via trap
+#   - P0: sysrc += fallback for FreeBSD <12.2 (removed -q flag for compatibility)
+#   - P0: write_file() temp leak fixed via global trap registration
 #   - P0: /proc/meminfo -> sysctl hw.physmem with validation
-#   - P1: login.conf cap_mkdb verified
-#   - P1: safe sysctl application (avoids -f compatibility gaps)
+#   - P0: BBR stack activation corrected (functions_default + tcp_rack dependency)
+#   - P1: login.conf cap_mkdb verified + newline safety
+#   - P1: safe sysctl application (marker-based parsing, handles = in values)
 #   - P1: route reconstruction uses safe route get/replace
 #   - P1: --dry-run previews actual content
 #   - P2: printf "$@" boundary fix
 #   - P2: UTC timestamps for backups
 #   - P2: module_available uses safe path fallback
 #   - P2: verify_sysctl handles permission/unreachable keys
-#   - P2: tcp_adv_win_scale injected as net.inet.tcp.tcp_adv_win_scale
+#   - P2: Removed non-existent tcp_adv_win_scale (Linux-only)
+#   - P2: Removed non-existent init_cwnd/init_rwnd sysctls
+#   - P2: Fixed tune_disk to not skip da* (SCSI/SAS/USB) devices
 
 set -u
 
@@ -158,19 +161,26 @@ calc_memory_tier() {
 }
 
 # Atomic file write with backup & temp leak protection (POSIX strict)
+# Global temp file tracking to avoid trap overwriting
+_WF_TMPFILES=""
+
+_global_cleanup() {
+    for _f in $_WF_TMPFILES; do rm -f "$_f" 2>/dev/null; done
+}
+trap _global_cleanup EXIT INT TERM HUP
+
 write_file() {
     _wf_path="$1"
     _wf_tmp="${_wf_path}.tmp.$$"
     
-    _wf_cleanup() { rm -f "$_wf_tmp" 2>/dev/null; }
-    trap _wf_cleanup EXIT INT TERM HUP
+    # Append to global list instead of overwriting trap
+    _WF_TMPFILES="$_WF_TMPFILES $_wf_tmp"
 
     if [ $DRY_RUN -eq 1 ]; then
         log_info "[DRY-RUN] Would write to: $_wf_path"
         log_info "--- BEGIN PREVIEW ---"
         cat
         log_info "--- END PREVIEW ---"
-        trap - EXIT INT TERM HUP
         return 0
     fi
 
@@ -181,18 +191,15 @@ write_file() {
 
     if ! cat >"$_wf_tmp"; then
         log_err "Failed to write temporary file for $_wf_path"
-        trap - EXIT INT TERM HUP
         return 1
     fi
 
     if ! mv -f "$_wf_tmp" "$_wf_path"; then
         log_err "Failed to install $_wf_path"
-        trap - EXIT INT TERM HUP
         return 1
     fi
 
     log_info "Written: $_wf_path"
-    trap - EXIT INT TERM HUP
     return 0
 }
 
@@ -256,7 +263,8 @@ generate_sysctl_conf() {
     cat <<EOF
 $MARKER
 # TCP Congestion & Queue
-net.inet.tcp.cc.algorithm=bbr
+# FreeBSD BBR is a TCP stack (not just congestion control), requires tcp_rack + functions_default
+net.inet.tcp.functions_default=bbr
 net.isr.direct=1
 net.isr.direct_force=1
 
@@ -266,7 +274,7 @@ net.inet.tcp.recvbuf_max=$RMEM_MAX
 net.inet.tcp.sendbuf_max=$WMEM_MAX
 net.inet.tcp.recvspace=65536
 net.inet.tcp.sendspace=65536
-net.inet.tcp.tcp_adv_win_scale=$WIN_SCALE
+# Note: Window scaling auto-negotiated via rfc1323=1, no manual tcp_adv_win_scale on FreeBSD
 
 # TCP Memory & Limits
 kern.ipc.maxsockbuf=33554432
@@ -345,21 +353,18 @@ tune_nic() {
 tune_disk() {
     _dev="$1"
     [ -z "$_dev" ] && return 0
-    # Skip CD/VD
-    case "$_dev" in cd*|da*) return 0 ;; esac
+    # Skip CD/memory disk/floppy only; da* (SCSI/SAS/USB) should be tuned
+    case "$_dev" in cd*|md*|fd*) return 0 ;; esac
 
     # FreeBSD GEOM scheduler is auto-tuned, skip manual overwrite
     log "Disk scheduling optimized by GEOM for $_dev"
 }
 
 tune_initcwnd() {
-    _default_iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')"
-    [ -z "$_default_iface" ] && return 0
-
-    # FreeBSD route replace syntax differs; we adjust net.inet.tcp.init_cwnd via sysctl if available
-    sysctl net.inet.tcp.init_cwnd=10 >/dev/null 2>&1 || true
-    sysctl net.inet.tcp.init_rwnd=10 >/dev/null 2>&1 || true
-    log "Applied initcwnd/initrwnd tuning"
+    # FreeBSD does not support per-route initcwnd/initrwnd via sysctl.
+    # The net.inet.tcp.init_cwnd and net.inet.tcp.init_rwnd OIDs do not exist.
+    # Window scaling is handled automatically via rfc1323=1 and path MTU discovery.
+    log "initcwnd tuning not supported on FreeBSD, skipping"
 }
 
 main() {
@@ -385,10 +390,15 @@ $(generate_sysctl_conf)
 EOF
     then
         if [ $DRY_RUN -eq 0 ]; then
-            # Safe apply: parse and feed to sysctl one by one (avoids -f compat issues)
-            awk -F= '/^[^#]/ && NF>1 {gsub(/^ +| +$/,""); print $1"="$2}' "$SYSCTL_CONF" | \
-            while IFS= read -r _kv; do
-                sysctl "$_kv" >/dev/null 2>&1 || true
+            # Safe apply: only parse newly appended block (after marker), handle values with = signs
+            awk "/^$MARKER$/,0" "$SYSCTL_CONF" | \
+            awk -F= '/^[^#[:space:]]/ && NF>=2 {
+                key=$1; $1=""; val=substr($0,2)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+                print key"="val
+            }' | while IFS= read -r _kv; do
+                sysctl "$_kv" >/dev/null 2>&1 || log_warn "sysctl failed: $_kv"
             done
             log_info "Sysctl parameters applied (live)"
         fi
@@ -397,6 +407,19 @@ EOF
 
 apply_limits() {
     log_info "Generating login.conf limits..."
+    # Ensure login.conf ends with newline before appending (prevents class definition粘连)
+    if [ -s "$LOGIN_CONF" ]; then
+        _last_char="$(tail -c1 "$LOGIN_CONF" 2>/dev/null || true)"
+        case "$_last_char" in
+            ''|'') printf '\n' >> "$LOGIN_CONF" ;;
+            *) 
+                # Check if last char is newline
+                if ! tail -c1 "$LOGIN_CONF" | grep -q $'\n' 2>/dev/null; then
+                    printf '\n' >> "$LOGIN_CONF"
+                fi
+                ;;
+        esac
+    fi
     append_once "$LOGIN_CONF" <<EOF
 $(generate_login_conf)
 EOF
@@ -408,12 +431,13 @@ EOF
 apply_rc_conf_modules() {
     log_info "Configuring kernel module loading in rc.conf..."
     
-    # Safe sysrc append (handles FreeBSD <12.2 lack of +=)
-    _cur="$(sysrc -qn kld_list 2>/dev/null || true)"
+    # Safe sysrc append (handles FreeBSD <12.2 lack of -q flag)
+    _cur="$(sysrc -n kld_list 2>/dev/null || true)"
     case "$_cur" in
-        *tcp_bbr*) log_info "tcp_bbr already in kld_list" ;;
+        *tcp_rack*tcp_bbr*|*tcp_bbr*tcp_rack*) log_info "tcp_rack and tcp_bbr already in kld_list" ;;
         *)
-            _new="${_cur:+$_cur }tcp_bbr"
+            # tcp_rack must be loaded before tcp_bbr (hard dependency)
+            _new="${_cur:+$_cur }tcp_rack tcp_bbr"
             sysrc kld_list="$_new" 2>/dev/null || log_warn "sysrc kld_list failed"
             ;;
     esac
@@ -439,12 +463,11 @@ EOF
 
 verify_configuration() {
     log_info "Verifying applied configuration..."
-    verify_sysctl "net.inet.tcp.cc.algorithm" "bbr" || true
+    verify_sysctl "net.inet.tcp.functions_default" "bbr" || true
     verify_sysctl "kern.ipc.somaxconn" "524288" || true
     verify_sysctl "net.inet.tcp.fastopen" "1" || true
-    verify_sysctl "net.inet.tcp.tcp_adv_win_scale" "$WIN_SCALE" || true
     [ -f "$LOGIN_CONF" ] && grep -qF "$MARKER" "$LOGIN_CONF" && log_info "✓ login.conf configured"
-    sysrc -qn seedbox_tune_enable 2>/dev/null | grep -q YES && log_info "✓ rc.d service enabled"
+    sysrc -n seedbox_tune_enable 2>/dev/null | grep -q YES && log_info "✓ rc.d service enabled"
 }
 
 print_summary() {
@@ -464,8 +487,8 @@ System: FreeBSD $(uname -r)
 Memory: $((TOTAL_MEM_KB / 1024)) MB | Virtualization: $VIRT_KIND
 
 Next steps:
-  1. Load BBR now: kldload tcp_bbr
-  2. Verify: sysctl net.inet.tcp.cc.algorithm
+  1. Load BBR stack now: kldload tcp_rack && kldload tcp_bbr
+  2. Verify: sysctl net.inet.tcp.functions_default
   3. Reboot or: service seedbox-tune start
 
 Rollback:

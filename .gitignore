@@ -1,3 +1,1 @@
-(debian.sh is a shell script file, which is source code, so no need to add to .gitignore)
-
-(empty - output nothing)
+Nothing should be ignored based on the provided file changes. The only modified file is 'freebsd.sh', which appears to be a shell script source file and not a build artifact, dependency, or temporary file.
