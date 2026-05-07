@@ -52,6 +52,11 @@ Security Note:
 USAGE
 }
 
+log() { printf '[*] %s\n' "$*"; }
+ok() { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+err() { printf '[x] %s\n' "$*" >&2; ERRORS=$((ERRORS + 1)); }
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
@@ -60,14 +65,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-log() { printf '[*] %s\n' "$*"; }
-ok() { printf '[+] %s\n' "$*"; }
-warn() { printf '[!] %s\n' "$*" >&2; }
-err() { printf '[x] %s\n' "$*" >&2; ERRORS=$((ERRORS + 1)); }
-
 # Atomic file writer with security hardening
 write_file() {
   _wf_path="$1"
+  _old_umask="$(umask)"
   if [ "$DRY_RUN" -eq 1 ]; then
     printf ' (dry-run) would write %s\n' "$_wf_path"
     cat >/dev/null
@@ -79,21 +80,29 @@ write_file() {
   fi
   _wf_dir="$(dirname "$_wf_path")"
   [ -d "$_wf_dir" ] || mkdir -p "$_wf_dir"
+  umask 077
   _wf_tmp="$(mktemp "${_wf_path}.tmp.XXXXXX")" || {
     err "Failed to create temporary file for $_wf_path"
+    umask "$_old_umask"
     return 1
   }
-  umask 077
+  trap 'rm -f "$_wf_tmp"' EXIT INT TERM HUP
   if ! cat >"$_wf_tmp"; then
     err "Failed to write to temporary file $_wf_tmp"
     rm -f "$_wf_tmp"
+    umask "$_old_umask"
+    trap - EXIT INT TERM HUP
     return 1
   fi
   if ! mv -f "$_wf_tmp" "$_wf_path"; then
     err "Failed to install $_wf_path"
     rm -f "$_wf_tmp"
+    umask "$_old_umask"
+    trap - EXIT INT TERM HUP
     return 1
   fi
+  trap - EXIT INT TERM HUP
+  umask "$_old_umask"
 }
 
 # --- preflight ------------------------------------------------------
@@ -204,12 +213,12 @@ vm.swap_idle_threshold2=10
 vfs.read_max=128
 vfs.write_max=128
 
-# Network Security / Stack
-net.inet.ip.fw.default_to_accept=1
+# Network Stack
 net.inet.tcp.syncache.hashsize=4096
 net.inet.tcp.syncache.cache=4096
 "
-printf '%s' "$SYSCTL_CONTENT" | write_file "$SYSCTL_CONF"
+SYSCTL_DROPIN="/etc/sysctl.d/99-seedbox.conf"
+printf '%s' "$SYSCTL_CONTENT" | write_file "$SYSCTL_DROPIN"
 
 # --- /boot/loader.conf ----------------------------------------------
 log "configuring ${LOADER_CONF}"
@@ -217,29 +226,25 @@ LOADER_LINES='tcp_bbr_load="YES"
 tcp_rack_load="YES"'
 
 if [ "$DRY_RUN" -eq 0 ]; then
-  NEEDS_UPDATE=0
-  for LINE in $LOADER_LINES; do
+  printf '%s\n' "$LOADER_LINES" | while IFS= read -r LINE; do
     if [ -f "$LOADER_CONF" ]; then
-      if ! grep -qxF "$LINE" "$LOADER_CONF" 2>/dev/null; then
-        NEEDS_UPDATE=1
-        break
-      fi
+      grep -qxF "$LINE" "$LOADER_CONF" 2>/dev/null || printf '%s\n' "$LINE" >> "$LOADER_CONF"
     else
-      NEEDS_UPDATE=1
-      break
+      printf '%s\n' "$LINE" >> "$LOADER_CONF"
     fi
   done
-  if [ "$NEEDS_UPDATE" -eq 1 ]; then
-    printf '%s\n' "$LOADER_LINES" >> "$LOADER_CONF"
-    ok "appended tcp_bbr_load/tcp_rack_load to $LOADER_CONF"
-  else
-    ok "BBR/RACK modules already configured in $LOADER_CONF"
-  fi
+  ok "ensured BBR/RACK modules in $LOADER_CONF"
 fi
 
 # --- rc.d service ---------------------------------------------------
 log "creating ${RC_SCRIPT}"
-cat >"$RC_SCRIPT.tmp" <<'RCSCRIPT'
+_rc_tmp="$(mktemp "${RC_SCRIPT}.tmp.XXXXXX")" || {
+  err "Failed to create temporary file for $RC_SCRIPT"
+  exit 1
+}
+trap 'rm -f "$_rc_tmp"' EXIT INT TERM HUP
+
+cat >"$_rc_tmp" <<'RCSCRIPT'
 #!/bin/sh
 #
 # PROVIDE: seedbox_tune
@@ -264,8 +269,8 @@ seedbox_tune_start() {
   ifc="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
   [ -z "$ifc" ] && return 0
 
-  # Apply sysctl
-  sysctl -f /etc/sysctl.conf >/dev/null 2>&1 || true
+  # Apply sysctl from drop-in
+  sysctl -f /etc/sysctl.d/99-seedbox.conf >/dev/null 2>&1 || true
 
   # NIC offloads: Bare-metal only
   local is_vm
@@ -293,9 +298,11 @@ RCSCRIPT
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf ' (dry-run) would install %s\n' "$RC_SCRIPT"
-  rm -f "$RC_SCRIPT.tmp"
+  rm -f "$_rc_tmp"
+  trap - EXIT INT TERM HUP
 else
-  mv -f "$RC_SCRIPT.tmp" "$RC_SCRIPT"
+  mv -f "$_rc_tmp" "$RC_SCRIPT"
+  trap - EXIT INT TERM HUP
   chmod 555 "$RC_SCRIPT"
   chown root:wheel "$RC_SCRIPT"
   ok "rc.d service installed"
@@ -303,10 +310,20 @@ fi
 
 # --- runtime helper -------------------------------------------------
 log "installing ${RUNTIME_HELPER}"
-cat >"$RUNTIME_HELPER.tmp" <<'HELPER'
+_helper_tmp="$(mktemp "${RUNTIME_HELPER}.tmp.XXXXXX")" || {
+  err "Failed to create temporary file for $RUNTIME_HELPER"
+  exit 1
+}
+trap 'rm -f "$_helper_tmp"' EXIT INT TERM HUP
+
+cat >"$_helper_tmp" <<'HELPER'
 #!/bin/sh
 # FasterSeedbox runtime helper (SECURITY-HARDENED)
 set -eu
+
+log()  { logger -t seedbox-tune "[*] $*" 2>/dev/null || printf '[*] %s\n' "$*"; }
+warn() { logger -t seedbox-tune "[!] $*" 2>/dev/null || printf '[!] %s\n' "$*" >&2; }
+
 IFACE="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
 [ -n "${IFACE:-}" ] || exit 0
 
@@ -316,7 +333,7 @@ VM_GUEST="$(sysctl -n kern.vm_guest 2>/dev/null || echo none)"
 # shellcheck disable=SC2034
 case "$VM_GUEST" in vmware|xen|kvm|qemu|hyperv|bhyve) IS_VM=1 ;; esac
 
-sysctl -f /etc/sysctl.conf >/dev/null 2>&1 || warn "Failed to apply sysctl.conf"
+sysctl -f /etc/sysctl.d/99-seedbox.conf >/dev/null 2>&1 || warn "Failed to apply sysctl drop-in"
 
 if [ "$IS_VM" -eq 0 ]; then
   ifconfig "$IFACE" tso 2>/dev/null || true
@@ -332,9 +349,11 @@ HELPER
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf ' (dry-run) would install %s\n' "$RUNTIME_HELPER"
-  rm -f "$RUNTIME_HELPER.tmp"
+  rm -f "$_helper_tmp"
+  trap - EXIT INT TERM HUP
 else
-  mv -f "$RUNTIME_HELPER.tmp" "$RUNTIME_HELPER"
+  mv -f "$_helper_tmp" "$RUNTIME_HELPER"
+  trap - EXIT INT TERM HUP
   chmod 755 "$RUNTIME_HELPER"
   ok "runtime helper installed"
 fi
