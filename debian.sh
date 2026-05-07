@@ -44,6 +44,12 @@ TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$_RAND_SUFFIX"
 DRY_RUN=0
 ERRORS=0
 
+# Logging functions (must be defined before argument parsing)
+log() { printf '[*] %s\n' "$*"; }
+ok() { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+err() { printf '[x] %s\n' "$*" >&2; ERRORS=$((ERRORS + 1)); }
+
 usage() {
  cat <<'USAGE' >&2
 FasterSeedbox — High-performance tuning for BitTorrent seedboxes
@@ -73,24 +79,26 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-log() { printf '[*] %s\n' "$*"; }
-ok() { printf '[+] %s\n' "$*"; }
-warn() { printf '[!] %s\n' "$*" >&2; }
-err() { printf '[x] %s\n' "$*" >&2; ERRORS=$((ERRORS + 1)); }
-
 # write_file
 # Reads content from stdin, writes atomically with secure temp file,
 # backs up any existing file with a timestamped suffix.
 # SECURITY FIXES:
 #   - Uses mktemp for unpredictable temp filename
-#   - Sets umask 077 to protect sensitive config content
+#   - Sets umask 077 BEFORE mktemp to protect sensitive config content
+#   - Saves and restores umask to avoid side effects
 #   - Validates write success before atomic move
 #   - Sets backup file permissions to 600
+#   - Adds trap for cleanup on signal interruption
 write_file() {
   _wf_path="$1"
+  # Save current umask and set restrictive mask BEFORE creating temp file
+  _old_umask="$(umask)"
+  umask 077
+  
   if [ "$DRY_RUN" -eq 1 ]; then
     printf ' (dry-run) would write %s\n' "$_wf_path"
     cat >/dev/null
+    umask "$_old_umask"
     return 0
   fi
   if [ -f "$_wf_path" ]; then
@@ -101,17 +109,22 @@ write_file() {
   _wf_dir="$(dirname "$_wf_path")"
   [ -d "$_wf_dir" ] || mkdir -p "$_wf_dir"
   
-  # SECURITY: Use mktemp for unpredictable filename + strict umask
+  # SECURITY: Use mktemp for unpredictable filename
   _wf_tmp="$(mktemp "${_wf_path}.tmp.XXXXXX")" || {
     err "Failed to create temporary file for $_wf_path"
+    umask "$_old_umask"
     return 1
   }
-  umask 077
+  
+  # Set trap for cleanup on interruption
+  trap 'rm -f "$_wf_tmp"' EXIT INT TERM HUP
   
   # Write content with error checking
   if ! cat >"$_wf_tmp"; then
     err "Failed to write to temporary file $_wf_tmp"
     rm -f "$_wf_tmp"
+    trap - EXIT INT TERM HUP
+    umask "$_old_umask"
     return 1
   fi
   
@@ -119,8 +132,14 @@ write_file() {
   if ! mv -f "$_wf_tmp" "$_wf_path"; then
     err "Failed to install $_wf_path"
     rm -f "$_wf_tmp"
+    trap - EXIT INT TERM HUP
+    umask "$_old_umask"
     return 1
   fi
+  
+  # Clear trap and restore umask on success
+  trap - EXIT INT TERM HUP
+  umask "$_old_umask"
 }
 
 # --- preflight ------------------------------------------------------
@@ -301,7 +320,8 @@ net.ipv4.tcp_wmem = ${TCP_WMEM}
 net.ipv4.tcp_mem = ${TCP_MEM}
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_window_scaling = ${WIN_SCALE}
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_adv_win_scale = ${WIN_SCALE}
 net.ipv4.tcp_init_cwnd = 10
 net.ipv4.tcp_slow_start_after_idle = 0
 net.core.somaxconn = 524288
@@ -390,6 +410,10 @@ write_file "$RUNTIME_HELPER" <<HELPER
 #   - Runtime resource limit validation
 
 set -eu
+
+# Logging functions (required for standalone execution)
+log() { logger -t seedbox-tune "[*] \$*" || printf '[*] %s\n' "\$*"; }
+warn() { logger -t seedbox-tune "[!] \$*" || printf '[!] %s\n' "\$*" >&2; }
 
 IFACE="\$(ip -o -4 route show to default 2>/dev/null | awk '{print \\\$5; exit}')"
 [ -n "\${IFACE:-}" ] || exit 0
@@ -540,7 +564,7 @@ RemainAfterExit=yes
 # Security hardening for the service itself
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/etc /var /run
+ReadWritePaths=/etc /var /run /sys
 NoNewPrivileges=true
 
 [Install]
