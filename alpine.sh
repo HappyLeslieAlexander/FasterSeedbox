@@ -53,6 +53,11 @@ Security Note:
 USAGE
 }
 
+log() { printf '[*] %s\n' "$*"; }
+ok() { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+err() { printf '[x] %s\n' "$*" >&2; ERRORS=$((ERRORS + 1)); }
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
@@ -61,17 +66,16 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-log() { printf '[*] %s\n' "$*"; }
-ok() { printf '[+] %s\n' "$*"; }
-warn() { printf '[!] %s\n' "$*" >&2; }
-err() { printf '[x] %s\n' "$*" >&2; ERRORS=$((ERRORS + 1)); }
-
 # Atomic file writer with security hardening
 write_file() {
   _wf_path="$1"
+  _old_umask="$(umask)"
+  umask 077
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf ' (dry-run) would write %s\n' "$_wf_path"
+    printf ' (dry-run) would write %s
+' "$_wf_path"
     cat >/dev/null
+    umask "$_old_umask"
     return 0
   fi
   if [ -f "$_wf_path" ]; then
@@ -80,22 +84,27 @@ write_file() {
   fi
   _wf_dir="$(dirname "$_wf_path")"
   [ -d "$_wf_dir" ] || mkdir -p "$_wf_dir"
-  
+
   _wf_tmp="$(mktemp "${_wf_path}.tmp.XXXXXX")" || {
     err "Failed to create temporary file for $_wf_path"
+    umask "$_old_umask"
     return 1
   }
-  umask 077
+  trap 'rm -f "$_wf_tmp"' EXIT INT TERM HUP
   if ! cat >"$_wf_tmp"; then
     err "Failed to write to temporary file $_wf_tmp"
     rm -f "$_wf_tmp"
+    umask "$_old_umask"
     return 1
   fi
   if ! mv -f "$_wf_tmp" "$_wf_path"; then
     err "Failed to install $_wf_path"
     rm -f "$_wf_tmp"
+    umask "$_old_umask"
     return 1
   fi
+  trap - EXIT INT TERM HUP
+  umask "$_old_umask"
 }
 
 # --- preflight ------------------------------------------------------
@@ -226,7 +235,8 @@ net.ipv4.tcp_wmem = ${TCP_WMEM}
 net.ipv4.tcp_mem = ${TCP_MEM}
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_window_scaling = ${WIN_SCALE}
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_adv_win_scale = ${WIN_SCALE}
 net.ipv4.tcp_init_cwnd = 10
 net.ipv4.tcp_slow_start_after_idle = 0
 net.core.somaxconn = 524288
@@ -271,6 +281,9 @@ write_file "$RUNTIME_HELPER" <<HELPER
 # Called by OpenRC service and installer.
 
 set -eu
+
+log()  { printf '[*] %s\n' "$*" || true; }
+warn() { printf '[!] %s\n' "$*" >&2 || true; }
 
 IFACE="\$(ip -o -4 route show to default 2>/dev/null | awk '{print \\\$5; exit}')"
 [ -n "\${IFACE:-}" ] || exit 0
@@ -369,7 +382,13 @@ ok "runtime helper installed"
 
 # --- OpenRC boot service -------------------------------------------
 log "installing ${RC_SCRIPT}"
-cat >"${RC_SCRIPT}.tmp" <<'RCSCRIPT'
+_rc_tmp="$(mktemp "${RC_SCRIPT}.tmp.XXXXXX")" || {
+  err "Failed to create temporary file for OpenRC script"
+  exit 1
+}
+trap 'rm -f "$_rc_tmp"' EXIT INT TERM HUP
+
+cat >"$_rc_tmp" <<'RCSCRIPT'
 #!/sbin/openrc-run
 #
 # FasterSeedbox runtime tuning service (OpenRC)
@@ -397,11 +416,13 @@ RCSCRIPT
 
 if [ "$DRY_RUN" -eq 1 ]; then
   printf ' (dry-run) would install %s\n' "$RC_SCRIPT"
-  rm -f "${RC_SCRIPT}.tmp"
+  rm -f "$_rc_tmp"
+  trap - EXIT INT TERM HUP
 else
-  mv -f "${RC_SCRIPT}.tmp" "$RC_SCRIPT"
+  mv -f "$_rc_tmp" "$RC_SCRIPT"
   chmod 755 "$RC_SCRIPT"
   chown root:root "$RC_SCRIPT"
+  trap - EXIT INT TERM HUP
   ok "OpenRC service installed"
 fi
 
