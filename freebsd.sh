@@ -189,9 +189,10 @@ SYSCTL_CONTENT="# FasterSeedbox sysctl configuration (Managed by script)
 # Applied: $(date -Iseconds 2>/dev/null || date)
 # Environment: ${VIRT_KIND} / FreeBSD $(uname -r)
 
-# TCP Function Framework: BBR + RACK (FreeBSD 12+ standard)
+# TCP Function Framework: BBR (FreeBSD 12+)
 net.inet.tcp.functions_default=bbr
-net.inet.tcp.fastopen=1
+net.inet.tcp.fastopen.server_enable=1
+net.inet.tcp.fastopen.client_enable=1
 net.inet.tcp.nolocaltimewait=1
 net.inet.tcp.sendbuf_auto=1
 net.inet.tcp.recvbuf_auto=1
@@ -332,6 +333,9 @@ VM_GUEST="$(sysctl -n kern.vm_guest 2>/dev/null || echo none)"
 # shellcheck disable=SC2034
 case "$VM_GUEST" in vmware|xen|kvm|qemu|hyperv|bhyve) IS_VM=1 ;; esac
 
+# Ensure BBR module is available immediately (loader.conf handles persistence)
+kldstat -q -m tcp_bbr 2>/dev/null || kldload tcp_bbr 2>/dev/null || warn "tcp_bbr.ko not loaded; bbr may be unavailable until reboot"
+
 sysctl -f /etc/sysctl.d/99-seedbox.conf >/dev/null 2>&1 || warn "Failed to apply sysctl drop-in"
 
 if [ "$IS_VM" -eq 0 ]; then
@@ -375,7 +379,7 @@ fi
 # --- apply immediately ----------------------------------------------
 if [ "$DRY_RUN" -eq 0 ]; then
   log "applying sysctl settings immediately..."
-  if sysctl -f "$SYSCTL_CONF" >/dev/null 2>&1; then
+  if sysctl -f "$SYSCTL_DROPIN" >/dev/null 2>&1; then
     ok "sysctl applied"
   else
     warn "sysctl warnings; check dmesg"
@@ -398,7 +402,8 @@ verify_sysctl() {
 if [ "$DRY_RUN" -eq 0 ]; then
   log "verifying critical parameters..."
   verify_sysctl net.inet.tcp.functions_default bbr
-  verify_sysctl net.inet.tcp.fastopen 1
+  verify_sysctl net.inet.tcp.fastopen.server_enable 1
+  verify_sysctl net.inet.tcp.fastopen.client_enable 1
   verify_sysctl kern.maxfiles "$MAX_FILES"
   verify_sysctl kern.ipc.somaxconn 524288
   # shellcheck disable=SC3045
