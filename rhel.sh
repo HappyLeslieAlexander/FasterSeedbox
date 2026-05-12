@@ -31,6 +31,7 @@ RUNTIME_HELPER="/usr/local/sbin/seedbox-runtime.sh"
 SYSTEMD_UNIT="/etc/systemd/system/seedbox-tune.service"
 TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$-$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || echo $$)"
 DRY_RUN=0
+VERBOSE=0
 ERRORS=0
 
 usage() {
@@ -41,6 +42,7 @@ Usage: $0 [OPTIONS]
 
 Options:
   --dry-run    Show what would be changed without applying
+  --verbose    Show detailed command errors/logs
   --help       Show this help message
 
 Examples:
@@ -57,10 +59,12 @@ log() { printf '[*] %s\n' "$*"; }
 ok() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
 err() { printf '[x] %s\n' "$*" >&2; ERRORS=$((ERRORS + 1)); }
+run_cmd() { if [ "$VERBOSE" -eq 1 ]; then "$@"; else "$@" 2>/dev/null; fi; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
     --help) usage; exit 0 ;;
     *) warn "unknown option: $1"; usage; exit 2 ;;
   esac
@@ -170,8 +174,8 @@ log "interface: ${IFACE} virt: ${VIRT_KIND} kernel: $(uname -r)"
 
 log "installing dependencies via ${PKGMGR}..."
 if [ "$DRY_RUN" -eq 0 ]; then
-  if ! ${PKGMGR} install -y ethtool iproute procps-ng tuned 2>/dev/null; then
-    warn "some packages failed to install; some features may be limited"
+  if ! run_cmd ${PKGMGR} install -y ethtool iproute procps-ng tuned; then
+    err "failed to install required packages: ethtool iproute procps-ng tuned"
   fi
 fi
 
@@ -179,7 +183,7 @@ fi
 # to avoid overriding custom sysadmin configurations.
 if command -v tuned-adm >/dev/null 2>&1; then
   if [ "$DRY_RUN" -eq 0 ]; then
-    systemctl enable --now tuned 2>/dev/null || warn "failed to enable tuned service"
+    run_cmd systemctl enable --now tuned || warn "failed to enable tuned service"
   fi
   CUR_PROFILE="$(tuned-adm active 2>/dev/null | awk -F': ' '/Current active profile/{print $2}' || echo unknown)"
   ok "tuned enabled (profile: ${CUR_PROFILE:-unknown})"
@@ -405,7 +409,7 @@ modprobe sch_fq 2>/dev/null || true
 modprobe tcp_bbr 2>/dev/null || warn "BBR module not available (install kernel-modules-extra or upgrade)"
 
 # Apply sysctl drop-ins (systemd standard)
-sysctl --system >/dev/null 2>&1 || warn "sysctl --system failed"
+run_cmd sysctl --system || err "sysctl --system failed"
 
 # Runtime ulimit fallback
 if [ "$(ulimit -n 2>/dev/null || echo 0)" -lt 65536 ]; then
@@ -439,7 +443,7 @@ WantedBy=multi-user.target
 EOF
 
 if [ "$DRY_RUN" -eq 0 ]; then
-  if systemctl enable seedbox-tune.service 2>/dev/null; then
+  if run_cmd systemctl enable seedbox-tune.service; then
     ok "seedbox-tune.service enabled"
   else
     warn "Failed to enable seedbox-tune.service"
@@ -451,7 +455,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     warn "Runtime helper completed with warnings"
   fi
   # Apply sysctl settings
-  if sysctl --system >/dev/null 2>&1; then
+  if run_cmd sysctl --system; then
     ok "Sysctl settings applied"
   else
     warn "Sysctl application had issues; review journalctl -xe"
