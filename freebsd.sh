@@ -14,7 +14,7 @@
 #
 # VERIFIED CORRECTIONS:
 #   ✅ FIXED: net.inet.tcp.functions_default=bbr (was cc.algorithm ❌)
-#   ✅ FIXED: loader.conf uses tcp_bbr_load/tcp_rack_load
+#   ✅ FIXED: loader.conf uses tcp_bbr_load
 #   ✅ Security: mktemp + umask 077, set -eu, safe route parsing
 #   ✅ Compatibility: sysrc fallback, rc.d standard structure
 #   ✅ Validation: post-apply sysctl verification
@@ -189,15 +189,15 @@ SYSCTL_CONTENT="# FasterSeedbox sysctl configuration (Managed by script)
 # Applied: $(date -Iseconds 2>/dev/null || date)
 # Environment: ${VIRT_KIND} / FreeBSD $(uname -r)
 
-# TCP Function Framework: BBR + RACK (FreeBSD 12+ standard)
+# TCP Function Framework: BBR (FreeBSD 12+)
 net.inet.tcp.functions_default=bbr
-net.inet.tcp.fastopen=1
+net.inet.tcp.fastopen.server_enable=1
+net.inet.tcp.fastopen.client_enable=1
 net.inet.tcp.nolocaltimewait=1
 net.inet.tcp.sendbuf_auto=1
 net.inet.tcp.recvbuf_auto=1
 net.inet.tcp.sendbuf_max=${WMEM_MAX}
 net.inet.tcp.recvbuf_max=${RMEM_MAX}
-net.inet.tcp.mbuf_limit=1048576
 
 # Connection & Kernel Limits
 kern.ipc.maxsockets=${MAX_SOCKETS}
@@ -207,23 +207,14 @@ kern.maxfiles=${MAX_FILES}
 kern.maxfilesperproc=${MAX_FILES}
 
 # VM / IO / Swap
-vm.swap_idle_enabled=1
-vm.swap_idle_threshold1=5
-vm.swap_idle_threshold2=10
 vfs.read_max=128
-vfs.write_max=128
-
-# Network Stack
-net.inet.tcp.syncache.hashsize=4096
-net.inet.tcp.syncache.cache=4096
 "
 SYSCTL_DROPIN="/etc/sysctl.d/99-seedbox.conf"
 printf '%s' "$SYSCTL_CONTENT" | write_file "$SYSCTL_DROPIN"
 
 # --- /boot/loader.conf ----------------------------------------------
 log "configuring ${LOADER_CONF}"
-LOADER_LINES='tcp_bbr_load="YES"
-tcp_rack_load="YES"'
+LOADER_LINES='tcp_bbr_load="YES"'
 
 if [ "$DRY_RUN" -eq 0 ]; then
   printf '%s\n' "$LOADER_LINES" | while IFS= read -r LINE; do
@@ -233,7 +224,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
       printf '%s\n' "$LINE" >> "$LOADER_CONF"
     fi
   done
-  ok "ensured BBR/RACK modules in $LOADER_CONF"
+  ok "ensured BBR module in $LOADER_CONF"
 fi
 
 # --- rc.d service ---------------------------------------------------
@@ -333,6 +324,9 @@ VM_GUEST="$(sysctl -n kern.vm_guest 2>/dev/null || echo none)"
 # shellcheck disable=SC2034
 case "$VM_GUEST" in vmware|xen|kvm|qemu|hyperv|bhyve) IS_VM=1 ;; esac
 
+# Ensure BBR module is available immediately (loader.conf handles persistence)
+kldstat -q -m tcp_bbr 2>/dev/null || kldload tcp_bbr 2>/dev/null || warn "tcp_bbr.ko not loaded; bbr may be unavailable until reboot"
+
 sysctl -f /etc/sysctl.d/99-seedbox.conf >/dev/null 2>&1 || warn "Failed to apply sysctl drop-in"
 
 if [ "$IS_VM" -eq 0 ]; then
@@ -376,7 +370,7 @@ fi
 # --- apply immediately ----------------------------------------------
 if [ "$DRY_RUN" -eq 0 ]; then
   log "applying sysctl settings immediately..."
-  if sysctl -f "$SYSCTL_CONF" >/dev/null 2>&1; then
+  if sysctl -f "$SYSCTL_DROPIN" >/dev/null 2>&1; then
     ok "sysctl applied"
   else
     warn "sysctl warnings; check dmesg"
@@ -399,7 +393,8 @@ verify_sysctl() {
 if [ "$DRY_RUN" -eq 0 ]; then
   log "verifying critical parameters..."
   verify_sysctl net.inet.tcp.functions_default bbr
-  verify_sysctl net.inet.tcp.fastopen 1
+  verify_sysctl net.inet.tcp.fastopen.server_enable 1
+  verify_sysctl net.inet.tcp.fastopen.client_enable 1
   verify_sysctl kern.maxfiles "$MAX_FILES"
   verify_sysctl kern.ipc.somaxconn 524288
   # shellcheck disable=SC3045
@@ -421,8 +416,8 @@ printf ' Interface   : %s\n' "$IFACE"
 printf ' Memory      : %s KB\n' "$MEM_KB"
 printf ' rmax/wmax   : %s / %s\n' "$RMEM_MAX" "$WMEM_MAX"
 printf ' maxfiles    : %s\n' "$MAX_FILES"
-printf ' TCP Stack   : BBR + RACK (functions_default=bbr)\n'
-printf ' Modules     : tcp_bbr.ko, tcp_rack.ko (loader.conf)\n'
+printf ' TCP Stack   : BBR (functions_default=bbr)\n'
+printf ' Modules     : tcp_bbr.ko (loader.conf)\n'
 printf ' Backup suffix: .bak-%s\n' "$TS"
 printf '\n Rollback instructions:\n'
 printf '  sysrc -q seedbox_tune_enable="NO" 2>/dev/null || echo "seedbox_tune_enable=NO" >> /etc/rc.conf\n'
