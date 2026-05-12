@@ -31,6 +31,7 @@ RC_SCRIPT="/etc/init.d/seedbox-tune"
 # Nanosecond + random suffix to prevent backup collisions
 TS="$(date +%Y%m%d-%H%M%S%N 2>/dev/null || date +%Y%m%d-%H%M%S)-$$-$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ' || echo $$)"
 DRY_RUN=0
+VERBOSE=0
 ERRORS=0
 
 usage() {
@@ -41,6 +42,7 @@ Usage: $0 [OPTIONS]
 
 Options:
   --dry-run    Show what would be changed without applying
+  --verbose    Show detailed command errors/logs
   --help       Show this help message
 
 Examples:
@@ -57,10 +59,12 @@ log() { printf '[*] %s\n' "$*"; }
 ok() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
 err() { printf '[x] %s\n' "$*" >&2; ERRORS=$((ERRORS + 1)); }
+run_cmd() { if [ "$VERBOSE" -eq 1 ]; then "$@"; else "$@" 2>/dev/null; fi; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
     --help) usage; exit 0 ;;
     *) warn "unknown option: $1"; usage; exit 2 ;;
   esac
@@ -161,8 +165,8 @@ log "interface: ${IFACE} virt: ${VIRT_KIND} kernel: $(uname -r)"
 
 log "installing dependencies (ethtool, iproute2, procps)..."
 if [ "$DRY_RUN" -eq 0 ]; then
-  apk update -q 2>/dev/null || warn "apk update failed; proceeding with cache"
-  apk add -q ethtool iproute2 procps 2>/dev/null || warn "some packages failed to install"
+  run_cmd apk update -q || err "apk update failed"
+  run_cmd apk add -q ethtool iproute2 procps || err "failed to install required packages: ethtool iproute2 procps"
 fi
 # tuned is not available/used in Alpine; CPU scaling relies on kernel governors
 ok "dependencies handled (Alpine uses kernel governors by default)"
@@ -361,13 +365,17 @@ if [ -n "\${IPROUTE:-}" ]; then
 fi
 
 # Modules (usually built-in on Alpine)
-modprobe sch_fq 2>/dev/null || true
-modprobe tcp_bbr 2>/dev/null || true
+modprobe sch_fq 2>/dev/null || warn "sch_fq module not available (may be built-in)"
+modprobe tcp_bbr 2>/dev/null || warn "tcp_bbr module not available (may be built-in)"
 
 # Apply sysctl drop-ins (Alpine compatible)
-for f in /etc/sysctl.d/*.conf; do
-  [ -f "\$f" ] && sysctl -p "\$f" >/dev/null 2>&1
-done
+if sysctl --help 2>&1 | grep -q -- '--system'; then
+  run_cmd sysctl --system || err "sysctl --system failed"
+else
+  for f in /etc/sysctl.d/*.conf; do
+    [ -f "\$f" ] && run_cmd sysctl -p "\$f"
+  done
+fi
 
 # Runtime ulimit fallback
 if [ "\$(ulimit -n 2>/dev/null || echo 0)" -lt 65536 ]; then
@@ -430,7 +438,7 @@ fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
   log "enabling seedbox-tune service..."
-  rc-update add seedbox-tune default 2>/dev/null || warn "rc-update failed; ensure openrc is running"
+  run_cmd rc-update add seedbox-tune default || warn "rc-update failed; ensure openrc is running"
   
   log "applying runtime settings immediately..."
   if "$RUNTIME_HELPER"; then
