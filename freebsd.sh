@@ -14,7 +14,7 @@
 #
 # VERIFIED CORRECTIONS:
 #   ✅ FIXED: net.inet.tcp.functions_default=bbr (was cc.algorithm ❌)
-#   ✅ FIXED: loader.conf uses tcp_bbr_load/tcp_rack_load
+#   ✅ FIXED: loader.conf uses tcp_bbr_load
 #   ✅ Security: mktemp + umask 077, set -eu, safe route parsing
 #   ✅ Compatibility: sysrc fallback, rc.d standard structure
 #   ✅ Validation: post-apply sysctl verification
@@ -222,8 +222,7 @@ printf '%s' "$SYSCTL_CONTENT" | write_file "$SYSCTL_DROPIN"
 
 # --- /boot/loader.conf ----------------------------------------------
 log "configuring ${LOADER_CONF}"
-LOADER_LINES='tcp_bbr_load="YES"
-tcp_rack_load="YES"'
+LOADER_LINES='tcp_bbr_load="YES"'
 
 if [ "$DRY_RUN" -eq 0 ]; then
   printf '%s\n' "$LOADER_LINES" | while IFS= read -r LINE; do
@@ -233,7 +232,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
       printf '%s\n' "$LINE" >> "$LOADER_CONF"
     fi
   done
-  ok "ensured BBR/RACK modules in $LOADER_CONF"
+  ok "ensured BBR module in $LOADER_CONF"
 fi
 
 # --- rc.d service ---------------------------------------------------
@@ -421,8 +420,8 @@ printf ' Interface   : %s\n' "$IFACE"
 printf ' Memory      : %s KB\n' "$MEM_KB"
 printf ' rmax/wmax   : %s / %s\n' "$RMEM_MAX" "$WMEM_MAX"
 printf ' maxfiles    : %s\n' "$MAX_FILES"
-printf ' TCP Stack   : BBR + RACK (functions_default=bbr)\n'
-printf ' Modules     : tcp_bbr.ko, tcp_rack.ko (loader.conf)\n'
+printf ' TCP Stack   : BBR (functions_default=bbr)\n'
+printf ' Modules     : tcp_bbr.ko (loader.conf)\n'
 printf ' Backup suffix: .bak-%s\n' "$TS"
 printf '\n Rollback instructions:\n'
 printf '  sysrc -q seedbox_tune_enable="NO" 2>/dev/null || echo "seedbox_tune_enable=NO" >> /etc/rc.conf\n'
