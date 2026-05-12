@@ -198,7 +198,6 @@ net.inet.tcp.sendbuf_auto=1
 net.inet.tcp.recvbuf_auto=1
 net.inet.tcp.sendbuf_max=${WMEM_MAX}
 net.inet.tcp.recvbuf_max=${RMEM_MAX}
-net.inet.tcp.mbuf_limit=1048576
 
 # Connection & Kernel Limits
 kern.ipc.maxsockets=${MAX_SOCKETS}
@@ -208,15 +207,7 @@ kern.maxfiles=${MAX_FILES}
 kern.maxfilesperproc=${MAX_FILES}
 
 # VM / IO / Swap
-vm.swap_idle_enabled=1
-vm.swap_idle_threshold1=5
-vm.swap_idle_threshold2=10
 vfs.read_max=128
-vfs.write_max=128
-
-# Network Stack
-net.inet.tcp.syncache.hashsize=4096
-net.inet.tcp.syncache.cache=4096
 "
 SYSCTL_DROPIN="/etc/sysctl.d/99-seedbox.conf"
 printf '%s' "$SYSCTL_CONTENT" | write_file "$SYSCTL_DROPIN"
